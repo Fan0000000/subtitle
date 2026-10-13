@@ -59,13 +59,12 @@ textarea{width:100%;height:240px;border:1px solid var(--bd);border-radius:8px;ba
     <option value="chi_tra">繁体中文</option>
     <option value="eng">英文</option>
   </select>
-  <label>取样间隔（越小越准但越慢）</label>
+  <label>画面比较间隔（只比较画面，不识别文字；越小越不容易漏掉很短的字幕）</label>
   <select id="step">
-    <option value="0.5">0.5 秒</option>
-    <option value="1" selected>1 秒</option>
+    <option value="0.5" selected>0.5 秒</option>
+    <option value="1">1 秒</option>
     <option value="2">2 秒</option>
   </select>
-  <label style="display:flex;gap:8px;align-items:center;color:var(--tx);margin-top:14px"><input type="checkbox" id="fine" checked> 精确时间轴（时间更准，耗时更长）</label>
   <button id="go">一键提取</button>
 </div>
 
@@ -169,7 +168,7 @@ function extract(data){
   let w=data.words;
   if(!w&&data.blocks)w=data.blocks.flatMap(b=>b.paragraphs.flatMap(p=>p.lines.flatMap(l=>l.words)));
   if(!w)return {text:clean(data.text||''),conf:data.confidence||0};
-  const k=w.filter(i=>i.confidence>=60&&/[\uac00-\ud7a3A-Za-z\u3400-\u9fff]/.test(i.text));
+  const k=w.filter(i=>(i.confidence>=60&&/[\uac00-\ud7a3A-Za-z\u3400-\u9fff]/.test(i.text))||(i.confidence>=70&&/\d/.test(i.text)&&/^[\d.,:%]+$/.test(i.text)));
   if(!k.length)return {text:'',conf:0};
   return {text:clean(k.map(i=>i.text).join(' ')),conf:k.reduce((s,i)=>s+i.confidence,0)/k.length};
 }
@@ -180,74 +179,93 @@ $('go').onclick=async()=>{
   try{wake=await navigator.wakeLock?.request('screen')}catch(e){}
   const step=+$('step').value,top=+$('top').value/100,bot=+$('bot').value/100;
   const W=v.videoWidth,H=v.videoHeight,sy=H*top,sh=H*(bot-top);
+  const mode=$('color').value,masked=mode!=='auto'&&mode!=='none';
   const scale=Math.max(1,Math.min(3,1400/W));
   const c=document.createElement('canvas');c.width=W*scale;c.height=sh*scale;
   const x=c.getContext('2d',{willReadFrequently:true});
-  const mode=$('color').value;
-  let lm=null;
-  const ocr=async(ms)=>{
-    ms=ms||(mode==='auto'?['none','white','dark','yellow']:[mode]);
-    let best={text:'',conf:0,m:ms[0]};
+  const sw=640,shh=Math.max(8,Math.round(sw*sh/W));
+  const sc=document.createElement('canvas');sc.width=sw;sc.height=shh;
+  const sx=sc.getContext('2d',{willReadFrequently:true});
+  const sig=()=>{
+    sx.drawImage(v,0,sy,W,sh,0,0,sw,shh);
+    if(masked)prep(sx,sc,mode);
+    const d=sx.getImageData(0,0,sw,shh).data,g=new Uint8Array(sw*shh);
+    let on=0;
+    for(let i=0,j=0;i<d.length;i+=4,j++){g[j]=(d[i]*299+d[i+1]*587+d[i+2]*114)/1000;if(g[j]<128)on++}
+    g.on=masked?on/g.length:1;
+    return g;
+  };
+  const diff=(a,b)=>{let n=0;for(let i=0;i<a.length;i++)if(Math.abs(a[i]-b[i])>40)n++;return n/a.length};
+  const TH=0.015;
+  const ocr=async()=>{
+    const ms=mode==='auto'?['none','white','dark','yellow']:[mode];
+    let best={text:'',conf:0};
     for(const m of ms){
       x.drawImage(v,0,sy,W,sh,0,0,c.width,c.height);prep(x,c,m);
       const {data}=await worker.recognize(c);
-      const r=extract(data);r.m=m;
+      const r=extract(data);
       if(r.conf>best.conf||(r.conf===best.conf&&r.text.length>best.text.length))best=r;
       if(best.conf>=85&&norm(best.text).length>=2)break;
     }
     return best;
   };
-  $('st').textContent='正在加载识别模型（首次较慢）…';
   let worker;
+  // 第1步：只比较画面，找出字幕变化的位置（不做文字识别）
+  const total=Math.floor(v.duration/step),runs=[];
+  let prev=null,cur=null;
+  for(let i=0;i<=total;i++){
+    const t=i*step;await seek(t);
+    const g=sig();
+    if(prev&&diff(prev,g)<=TH){cur.b=t;cur.on=Math.max(cur.on,g.on)}
+    else{cur={a:t,b:t,on:g.on};runs.push(cur)}
+    prev=g;
+    if(i%5===0){$('bar').value=i/total*0.4;$('st').textContent=`第 1/3 步：分析画面变化 ${Math.round(i/total*100)}%`}
+  }
+  // 第2步：每一段稳定画面只识别一次
+  $('st').textContent='第 2/3 步：正在加载识别模型（首次较慢）…';
   try{worker=await Tesseract.createWorker($('lang').value);}
   catch(err){$('st').textContent='模型加载失败，请检查网络后重试。';$('go').disabled=false;return;}
   await worker.setParameters({tessedit_pageseg_mode:'6'});
-  const total=Math.floor(v.duration/step);
-  let cur=null;
-  const close=end=>{if(cur){cur.e=end;if(norm(cur.t).length>=2)cues.push({s:cur.s,e:cur.e,t:cur.t,last:cur.last,m:cur.m});cur=null}};
-  for(let i=0;i<=total;i++){
-    const t=i*step;
-    await seek(t);
-    const {text,conf,m}=await ocr(),n=norm(text);
-    const ok=n.length>=2&&conf>=60;
-    if(ok){
-      if(cur&&sim(norm(cur.t),n)>=0.6){
-        if(conf>cur.q){cur.t=text;cur.q=conf;cur.m=m}
-        cur.last=t;
-      }else{
-        close(t);cur={s:t,t:text,q:conf,last:t,m};
-      }
-    }else if(cur){close(cur.last+step)}
-    $('bar').value=i/total;
-    $('st').textContent=`识别中 ${i}/${total}　已得到 ${cues.length} 条`;
-  }
-  close(cur?cur.last+step:0);
-  if($('fine').checked&&cues.length){
-    const look=async(t,txt)=>{
-      await seek(t);
-      const r=await ocr(lm);
-      return sim(norm(r.text),norm(txt))>=0.5;
-    };
-    const it=step>=1?4:3;
-    for(let k=0;k<cues.length;k++){
-      const q=cues[k];lm=q.m?[q.m]:null;
-      $('st').textContent=`精确定位时间轴 ${k+1}/${cues.length}`;
-      $('bar').value=k/cues.length;
-      if(q.s>0){
-        let lo=Math.max(0,q.s-step),hi=q.s;
-        for(let j=0;j<it;j++){const m=(lo+hi)/2;if(await look(m,q.t))hi=m;else lo=m;}
-        q.s=hi;
-      }
-      let lo=q.last,hi=q.last+step;
-      for(let j=0;j<it;j++){const m=(lo+hi)/2;if(await look(m,q.t))lo=m;else hi=m;}
-      q.e=hi;
+  for(let k=0;k<runs.length;k++){
+    const r=runs[k];r.text='';r.conf=0;
+    $('bar').value=0.4+k/runs.length*0.4;
+    $('st').textContent=`第 2/3 步：识别文字 ${k+1}/${runs.length}`;
+    if(masked&&r.on<0.003)continue;
+    let best={text:'',conf:0};
+    const ts=[(r.a+r.b)/2];
+    if(r.b>r.a)ts.push(r.a,r.b);
+    for(let j=0;j<ts.length;j++){
+      await seek(ts[j]);
+      const o=await ocr();
+      if(o.conf>best.conf)best=o;
+      if(best.conf>=80&&norm(best.text).length>=2)break;
     }
-    cues.forEach((q,i)=>{if(i&&q.s<cues[i-1].e)q.s=cues[i-1].e;if(q.e<=q.s)q.e=q.s+0.3});
+    r.text=best.text;r.conf=best.conf;
+  }
+  // 第3步：精确定位每段字幕出现和消失的时刻
+  const R=runs.length,B=new Array(R+1);B[0]=0;B[R]=v.duration;
+  const it=step>=1?5:4;
+  for(let k=1;k<R;k++){
+    const L=runs[k-1].b,Rt=runs[k].a;
+    $('bar').value=0.8+k/R*0.2;
+    $('st').textContent=`第 3/3 步：精确定位时间轴 ${k}/${R-1}`;
+    if(!runs[k-1].text&&!runs[k].text){B[k]=Rt;continue}
+    await seek(L);const g0=sig();
+    let lo=L,hi=Rt;
+    for(let j=0;j<it;j++){const m=(lo+hi)/2;await seek(m);if(diff(sig(),g0)>TH)hi=m;else lo=m}
+    B[k]=hi;
   }
   await worker.terminate();
   try{wake?.release()}catch(e){}
+  const list=[];
+  runs.forEach((r,k)=>{if(norm(r.text).length>=2&&r.conf>=60)list.push({s:B[k],e:B[k+1],t:r.text,q:r.conf})});
+  for(const q of list){
+    const p=cues[cues.length-1];
+    if(p&&sim(norm(p.t),norm(q.t))>=0.85&&q.s-p.e<=0.3){p.e=q.e;if(q.q>p.q){p.t=q.t;p.q=q.q}}
+    else cues.push(q);
+  }
   $('bar').value=1;
-  $('st').textContent=`完成，共 ${cues.length} 条字幕，建议下载后校对错字。`;
+  $('st').textContent=`完成，共 ${cues.length} 条字幕，建议下载后校对。`;
   $('txt').value=toSrt();$('out').hidden=false;$('go').disabled=false;
 };
 
