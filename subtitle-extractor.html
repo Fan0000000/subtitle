@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>硬字幕提取</title>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--tx:#1b1f24;--mu:#6b7280;--ac:#2563eb;--bd:#e5e7eb}
+@media (prefers-color-scheme:dark){:root{--bg:#111418;--card:#1b2026;--tx:#e8eaed;--mu:#9aa3ad;--ac:#5b8def;--bd:#2c333b}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--tx);font:16px/1.5 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;padding:16px;max-width:640px;margin:auto}
+h1{font-size:20px;margin:4px 0 12px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:14px;margin-bottom:12px}
+label{display:block;font-size:14px;color:var(--mu);margin:10px 0 4px}
+input[type=range],select{width:100%}
+select{padding:8px;border-radius:8px;border:1px solid var(--bd);background:var(--card);color:var(--tx);font-size:15px}
+button{width:100%;padding:13px;border:0;border-radius:10px;background:var(--ac);color:#fff;font-size:16px;font-weight:600;margin-top:10px}
+button.sec{background:transparent;color:var(--ac);border:1px solid var(--ac)}
+button:disabled{opacity:.5}
+canvas{width:100%;border-radius:8px;background:#000;display:block}
+progress{width:100%;height:10px}
+textarea{width:100%;height:240px;border:1px solid var(--bd);border-radius:8px;background:var(--card);color:var(--tx);padding:8px;font-size:14px}
+.row{display:flex;gap:8px}.row button{margin-top:8px}
+.mu{color:var(--mu);font-size:13px}
+</style>
+</head>
+<body>
+<h1>视频硬字幕提取</h1>
+
+<div class="card">
+  <input type="file" id="file" accept="video/*">
+  <p class="mu">视频只在本机浏览器里处理，不会上传。首次使用需联网下载中文识别模型。</p>
+  <p id="msg" style="font-size:14px;color:#d97706"></p>
+</div>
+
+<div class="card" id="setup" hidden>
+  <canvas id="pv"></canvas>
+  <p class="mu">红框内是识别区域，请调到刚好框住字幕。</p>
+  <label>区域上边界：<span id="tv">75</span>%</label>
+  <input type="range" id="top" min="0" max="95" value="75">
+  <label>区域下边界：<span id="bv">100</span>%</label>
+  <input type="range" id="bot" min="5" max="100" value="100">
+  <label>识别语言</label>
+  <select id="lang">
+    <option value="chi_sim">简体中文</option>
+    <option value="chi_sim+eng">中文 + 英文</option>
+    <option value="chi_tra">繁体中文</option>
+    <option value="eng">英文</option>
+  </select>
+  <label>取样间隔（越小越准但越慢）</label>
+  <select id="step">
+    <option value="0.5">0.5 秒</option>
+    <option value="1" selected>1 秒</option>
+    <option value="2">2 秒</option>
+  </select>
+  <button id="go">一键提取</button>
+</div>
+
+<div class="card" id="prog" hidden>
+  <progress id="bar" value="0" max="1"></progress>
+  <p class="mu" id="st">准备中…</p>
+  <p class="mu">识别期间请保持页面在前台，不要锁屏。</p>
+</div>
+
+<div class="card" id="out" hidden>
+  <textarea id="txt"></textarea>
+  <div class="row">
+    <button id="dsrt">下载 SRT</button>
+    <button id="dtxt" class="sec">下载 TXT</button>
+  </div>
+  <button id="cp" class="sec">复制文本</button>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
+<script>
+const $=id=>document.getElementById(id);
+const v=document.createElement('video');
+v.muted=true;v.playsInline=true;v.preload='auto';
+let cues=[],name='subtitle',wake=null;
+
+function seek(t){return new Promise(r=>{
+  const f=()=>{v.removeEventListener('seeked',f);r()};
+  v.addEventListener('seeked',f);v.currentTime=Math.min(t,Math.max(0,v.duration-0.05));
+});}
+
+function drawPreview(){
+  const c=$('pv');if(!v.videoWidth)return;
+  c.width=v.videoWidth;c.height=v.videoHeight;
+  const x=c.getContext('2d');x.drawImage(v,0,0);
+  const t=+$('top').value,b=+$('bot').value;
+  x.strokeStyle='#ff2d2d';x.lineWidth=Math.max(3,c.width/200);
+  x.strokeRect(0,c.height*t/100,c.width,c.height*(b-t)/100);
+}
+$('top').oninput=$('bot').oninput=()=>{
+  if(+$('top').value>=+$('bot').value-3)$('top').value=+$('bot').value-3;
+  $('tv').textContent=$('top').value;$('bv').textContent=$('bot').value;drawPreview();
+};
+
+$('file').onchange=async e=>{
+  const f=e.target.files[0];if(!f)return;
+  name=f.name.replace(/\.[^.]+$/,'');
+  $('msg').textContent='正在读取视频…';
+  $('setup').hidden=true;
+  v.src=URL.createObjectURL(f);
+  const ok=await new Promise(r=>{
+    v.onloadedmetadata=()=>r(true);
+    v.onerror=()=>r(false);
+    setTimeout(()=>r(false),15000);
+  });
+  if(!ok||!v.videoWidth){
+    $('msg').textContent='这个视频无法在当前浏览器里解码（常见于 YouTube 下载的 VP9/AV1 编码文件）。请换成 H.264 编码的 mp4，或在 Safari/Chrome 里打开本页再试。';
+    return;
+  }
+  $('msg').textContent='';
+  await seek(v.duration*0.3);
+  $('setup').hidden=false;$('prog').hidden=true;$('out').hidden=true;
+  drawPreview();
+};
+
+const clean=s=>s.replace(/\n+/g,' ')
+  .replace(/([\u3400-\u9fff，。！？、：；“”‘’《》（）])\s+(?=[\u3400-\u9fff，。！？、：；“”‘’《》（）])/g,'$1')
+  .replace(/\s+/g,' ').trim();
+const norm=s=>s.replace(/[\s\p{P}\p{S}]/gu,'');
+function sim(a,b){
+  if(!a||!b)return 0;if(a===b)return 1;
+  const g=s=>{const m=new Map();for(let i=0;i<s.length-1;i++){const k=s.substr(i,2);m.set(k,(m.get(k)||0)+1)}return m};
+  if(a.length<2||b.length<2)return a===b?1:0;
+  const A=g(a),B=g(b);let n=0;
+  A.forEach((c,k)=>{if(B.has(k))n+=Math.min(c,B.get(k))});
+  return 2*n/(a.length+b.length-2);
+}
+const ts=t=>{
+  const ms=Math.round(t*1000),h=Math.floor(ms/3600000),m=Math.floor(ms%3600000/60000),
+  s=Math.floor(ms%60000/1000),r=ms%1000,p=(n,l=2)=>String(n).padStart(l,'0');
+  return `${p(h)}:${p(m)}:${p(s)},${p(r,3)}`;
+};
+const toSrt=()=>cues.map((c,i)=>`${i+1}\n${ts(c.s)} --> ${ts(c.e)}\n${c.t}\n`).join('\n');
+const toTxt=()=>cues.map(c=>c.t).join('\n');
+
+$('go').onclick=async()=>{
+  $('go').disabled=true;$('prog').hidden=false;$('out').hidden=true;cues=[];
+  try{wake=await navigator.wakeLock?.request('screen')}catch(e){}
+  const step=+$('step').value,top=+$('top').value/100,bot=+$('bot').value/100;
+  const W=v.videoWidth,H=v.videoHeight,sy=H*top,sh=H*(bot-top);
+  const scale=Math.max(1,Math.min(3,1400/W));
+  const c=document.createElement('canvas');c.width=W*scale;c.height=sh*scale;
+  const x=c.getContext('2d',{willReadFrequently:true});
+  $('st').textContent='正在加载识别模型（首次较慢）…';
+  let worker;
+  try{worker=await Tesseract.createWorker($('lang').value);}
+  catch(err){$('st').textContent='模型加载失败，请检查网络后重试。';$('go').disabled=false;return;}
+  await worker.setParameters({tessedit_pageseg_mode:'6'});
+  const total=Math.floor(v.duration/step);
+  let cur=null;
+  const close=end=>{if(cur){cur.e=end;if(norm(cur.t).length>=2)cues.push({s:cur.s,e:cur.e,t:cur.t});cur=null}};
+  for(let i=0;i<=total;i++){
+    const t=i*step;
+    await seek(t);
+    x.drawImage(v,0,sy,W,sh,0,0,c.width,c.height);
+    const {data}=await worker.recognize(c);
+    const text=clean(data.text||''),n=norm(text);
+    const ok=n.length>=2&&data.confidence>=40;
+    if(ok){
+      if(cur&&sim(norm(cur.t),n)>=0.6){
+        if(data.confidence>cur.q){cur.t=text;cur.q=data.confidence}
+        cur.last=t;
+      }else{
+        close(t);cur={s:t,t:text,q:data.confidence,last:t};
+      }
+    }else if(cur){close(cur.last+step)}
+    $('bar').value=i/total;
+    $('st').textContent=`识别中 ${i}/${total}　已得到 ${cues.length} 条`;
+  }
+  close(cur?cur.last+step:0);
+  await worker.terminate();
+  try{wake?.release()}catch(e){}
+  $('bar').value=1;
+  $('st').textContent=`完成，共 ${cues.length} 条字幕，建议下载后校对错字。`;
+  $('txt').value=toSrt();$('out').hidden=false;$('go').disabled=false;
+};
+
+function dl(txt,ext){
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob([ext==='srt'?'\ufeff'+txt:txt],{type:'text/plain;charset=utf-8'}));
+  a.download=name+'.'+ext;document.body.appendChild(a);a.click();a.remove();
+}
+$('dsrt').onclick=()=>{$('txt').value=toSrt();dl(toSrt(),'srt')};
+$('dtxt').onclick=()=>{$('txt').value=toTxt();dl(toTxt(),'txt')};
+$('cp').onclick=async()=>{
+  try{await navigator.clipboard.writeText($('txt').value);$('cp').textContent='已复制'}
+  catch(e){$('txt').select();document.execCommand('copy');$('cp').textContent='已复制'}
+  setTimeout(()=>$('cp').textContent='复制文本',1500);
+};
+</script>
+</body>
+</html>
